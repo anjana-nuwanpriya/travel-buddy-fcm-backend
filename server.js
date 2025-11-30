@@ -3,20 +3,19 @@
 // ===============================================
 require('dotenv').config();
 
-// Validate env
+// Validate required env variables
 if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ ERROR: SUPABASE_SERVICE_ROLE_KEY is missing!");
-  console.error("➡️  Fix: Add SUPABASE_SERVICE_ROLE_KEY to your .env file");
   process.exit(1);
 }
 if (!process.env.SUPABASE_URL) {
   console.error("❌ ERROR: SUPABASE_URL is missing!");
   process.exit(1);
 }
-
-console.log("🔑 Environment loaded:");
-console.log("   SUPABASE_SERVICE_ROLE_KEY:", process.env.SUPABASE_SERVICE_ROLE_KEY ? "OK" : "MISSING");
-console.log("   SUPABASE_URL:", process.env.SUPABASE_URL);
+if (!process.env.FIREBASE_PROJECT_ID) {
+  console.error("❌ ERROR: FIREBASE_PROJECT_ID is missing!");
+}
+console.log("🔑 Environment loaded");
 
 // ===============================================
 // Imports
@@ -27,7 +26,7 @@ const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 
 // ===============================================
-// Configuration
+// App configuration
 // ===============================================
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -71,93 +70,81 @@ app.get('/health', (req, res) => {
 });
 
 // ===============================================
-// QUEUE PROCESSOR (with improved logging)
+// QUEUE PROCESSOR
 // ===============================================
 async function processNotificationQueue() {
   console.log("⏳ Polling queue...");
 
-  try {
-    const { data: pending, error } = await supabase
-      .from('fcm_notification_queue')
-      .select('*')
-      .eq('status', 'pending')
-      .order('created_at', { ascending: true })
-      .limit(10);
+  const { data: pending, error } = await supabase
+    .from('fcm_notification_queue')
+    .select('*')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true })
+    .limit(10);
 
-    // Log raw error if exists
-    if (error) {
-      console.error("🔥 Supabase Query Error:", error);
-      return;
-    }
+  if (error) {
+    console.error("🔥 Supabase Query Error:", error.message);
+    return;
+  }
 
-    console.log("📦 Query result:", pending);
+  if (!pending || pending.length === 0) {
+    console.log("📭 No pending notifications");
+    return;
+  }
 
-    if (!pending || pending.length === 0) {
-      console.log("📭 No pending notifications");
-      return;
-    }
+  console.log(`📬 Processing ${pending.length} notifications...`);
 
-    console.log(`📬 Processing ${pending.length} notifications...`);
+  for (const n of pending) {
+    try {
+      console.log(`📤 Sending: ${n.title}`);
 
-    for (const n of pending) {
-      try {
-        console.log(`📤 Sending: ${n.title}`);
-
-        await admin.messaging().send({
-          token: n.fcm_token,
+      await admin.messaging().send({
+        token: n.fcm_token,
+        notification: {
+          title: n.title,
+          body: n.body,
+        },
+        data: n.data || {},
+        android: {
+          priority: 'high',
           notification: {
-            title: n.title,
-            body: n.body,
+            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+            sound: 'default',
+            channelId:
+              n.type === 'chat'
+                ? 'travel_buddy_chat'
+                : 'travel_buddy_rides',
           },
-          data: n.data || {},
-          android: {
-            priority: 'high',
-            notification: {
-              clickAction: 'FLUTTER_NOTIFICATION_CLICK',
-              sound: 'default',
-              channelId:
-                n.type === 'chat'
-                  ? 'travel_buddy_chat'
-                  : 'travel_buddy_rides',
-            },
-          },
-        });
+        },
+      });
 
-        // Update status
-        const { error: updateError } = await supabase
-          .from('fcm_notification_queue')
-          .update({
-            status: 'sent',
-            sent_at: new Date().toISOString()
-          })
-          .eq('id', n.id);
+      // Mark as sent
+      await supabase
+        .from('fcm_notification_queue')
+        .update({
+          status: 'sent',
+          sent_at: new Date().toISOString()
+        })
+        .eq('id', n.id);
 
-        if (updateError) {
-          console.error("❌ DB update error:", updateError);
-        } else {
-          console.log("   ✅ Sent and updated");
-        }
+      console.log("   ✅ Sent & updated");
 
-      } catch (err) {
-        console.error(`   ❌ Send failed: ${err.message}`);
+    } catch (err) {
+      console.error(`   ❌ Send failed: ${err.message}`);
 
-        await supabase
-          .from('fcm_notification_queue')
-          .update({
-            status: 'failed',
-            attempts: n.attempts + 1,
-            error_message: err.message
-          })
-          .eq('id', n.id);
-      }
+      await supabase
+        .from('fcm_notification_queue')
+        .update({
+          status: 'failed',
+          attempts: (n.attempts || 0) + 1,
+          error_message: err.message
+        })
+        .eq('id', n.id);
     }
-
-  } catch (error) {
-    console.error("❌ Queue processing error:", error.message);
   }
 }
 
-// Manual trigger (POST)
+// Manual trigger
 app.post('/process-queue', async (req, res) => {
   try {
     await processNotificationQueue();
@@ -171,19 +158,17 @@ app.post('/process-queue', async (req, res) => {
 // START SERVER
 // ===============================================
 app.listen(PORT, () => {
-  console.log('');
-  console.log('='.repeat(60));
+  console.log('\n' + '='.repeat(60));
   console.log('🚀 Travel Buddy FCM Notifications Backend');
   console.log('='.repeat(60));
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 Manual trigger: POST http://localhost:${PORT}/process-queue`);
   console.log('');
-  console.log('🔄 Starting notification queue polling (every 2s)...');
+  console.log('🔄 Polling queue every 2 seconds...');
   console.log('='.repeat(60));
   console.log('');
 
-  // Start polling
   setInterval(processNotificationQueue, 2000);
 });
 
